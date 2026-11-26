@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid38858",
+  "B": "/home/dev/feedback/uid38858",
+  "sha": "c7ef29f95c110c87191c950272cf687d350d79cf",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "hugsy",
+    "repo": "gef",
+    "sha": "c7ef29f95c110c87191c950272cf687d350d79cf"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "gef",
+    "cloneUrl": "https://github.com/Rrr119/gef.git"
+  },
+  "at": "2026-11-26T00:44:10.771Z"
+}

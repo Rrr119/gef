@@ -2,6 +2,8 @@
 Heap commands test module
 """
 
+import json
+
 import pytest
 from tests.base import RemoteGefUnitTestGeneric
 from tests.utils import (
@@ -367,3 +369,99 @@ class HeapCommandTcache(RemoteGefUnitTestGeneric):
         else:
             self.assertIn("Tcachebins[idx=0, size=0x20, count=3]", tcachelines[0])
             self.assertIn("Tcachebins[idx=1, size=0x30, count=3]", tcachelines[1])
+
+
+@pytest.mark.skipif(not is_glibc_ge(2, 26), reason="tcache is required for this test")
+class HeapBinsVisualizeCommand(RemoteGefUnitTestGeneric):
+    def setUp(self) -> None:
+        self._target = debug_target("heap-visual")
+        super().setUp()
+
+    def _layout(self, layout: int, breakpoint: bool = False):
+        gdb = self._gdb
+        if breakpoint:
+            gdb.execute("break visual_acceptance_marker")
+        gdb.execute(f"run {layout}")
+
+        raw = gdb.execute("heap bins visualize --json", to_string=True)
+        data = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+
+        ptr_raw = gdb.execute(
+            "python print(json.dumps([int(gdb.parse_and_eval("
+            '"visual_ptrs[%d]" % i)) for i in range(19)]))',
+            to_string=True,
+        )
+        ptrs = json.loads(ptr_raw[ptr_raw.find("[") : ptr_raw.rfind("]") + 1])
+        return data, ptrs
+
+    def _buckets(self, data):
+        buckets = []
+        for context in data["tcache"]:
+            self.assertTrue(context["available"], context)
+            buckets.extend(context["buckets"])
+        fast_context = data["fastbins"]
+        if fast_context and fast_context.get("available"):
+            buckets.extend(fast_context["buckets"])
+        return buckets
+
+    def _assert_chain(self, data, expected):
+        for bucket in self._buckets(data):
+            entries = bucket["entries"]
+            if entries[: len(expected)] == expected:
+                self.assertEqual(entries, expected)
+                self.assertEqual(bucket["observed_count"], len(expected))
+                self.assertEqual(bucket["state"], "ok", bucket["issues"])
+                return bucket
+        self.fail(f"No visualized chain matches {[hex(x) for x in expected]}")
+
+    def test_visualize_layout_empty(self):
+        data, _ = self._layout(0)
+        self.assertEqual(data["statistics"]["totals"]["chunks"], 0)
+        text = self._gdb.execute("heap bins visualize --ascii", to_string=True)
+        self.assertIn("All tcache buckets are empty", text)
+
+    def test_visualize_layout_tcache_size_buckets(self):
+        data, ptrs = self._layout(1)
+        self._assert_chain(data, [ptrs[2], ptrs[1], ptrs[0]])
+        self._assert_chain(data, [ptrs[9], ptrs[8]])
+        self._assert_chain(data, [ptrs[16]])
+        self.assertEqual(data["statistics"]["totals"]["chunks"], 6)
+
+        text = self._gdb.execute("heap bins visualize --ascii", to_string=True)
+        for address in (ptrs[2], ptrs[9], ptrs[16]):
+            self.assertIn(f"Chunk(addr={address:#x}", text)
+        self.assertIn("== Size-bucket statistics ==", text)
+
+    def test_visualize_layout_full_tcache_and_fastbin(self):
+        data, ptrs = self._layout(2)
+        context = next(context for context in data["tcache"] if context["available"])
+        capacity = context.get("slot_capacity") or 7
+        tcache_count = min(9, capacity)
+        self._assert_chain(
+            data,
+            [ptrs[index] for index in range(tcache_count - 1, -1, -1)],
+        )
+        self._assert_chain(data, [ptrs[18], ptrs[17], ptrs[16]])
+
+        fast_context = data["fastbins"]
+        if tcache_count < 9 and fast_context and fast_context.get("available"):
+            self._assert_chain(
+                data,
+                [ptrs[index] for index in range(8, tcache_count - 1, -1)],
+            )
+
+        self.assertEqual(data["statistics"]["totals"]["issues"], 0)
+
+    def test_visualize_preserves_breakpoint_state(self):
+        gdb = self._gdb
+        data, _ = self._layout(0, breakpoint=True)
+        breakpoints = gdb.breakpoints()
+        self.assertEqual(len(breakpoints), 1)
+        self.assertEqual(breakpoints[0].hit_count, 1)
+
+        gdb.execute("heap bins visualize")
+        gdb.execute("heap bins stats")
+        breakpoints = gdb.breakpoints()
+        self.assertEqual(len(breakpoints), 1)
+        self.assertEqual(breakpoints[0].hit_count, 1)
+        self.assertGreaterEqual(data["statistics"]["totals"]["chunks"], 0)

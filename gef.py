@@ -65,6 +65,7 @@ import importlib
 import importlib.util
 import inspect
 import itertools
+import json
 import os
 import pathlib
 import platform
@@ -7780,14 +7781,855 @@ class GlibcHeapChunksCommand(GenericCommand):
         return True
 
 
+class HeapBinVisualizer:
+    """Collect and render tcache/fastbin freelist state without resuming the inferior."""
+
+    BIN_NAMES = {
+        "tcache": "tcache",
+        "tcachebin": "tcache",
+        "tcachebins": "tcache",
+        "fast": "fastbin",
+        "fastbin": "fastbin",
+        "fastbins": "fastbin",
+        "fastbinsy": "fastbin",
+    }
+
+    def parse_arguments(
+        self, argv: list[str], forced_kinds: set[str] | None = None
+    ) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "argv": [],
+            "kinds": set(forced_kinds or ()),
+            "all_threads": False,
+            "thread_ids": [],
+            "arena": None,
+            "json": False,
+            "visual": False,
+            "stats": None,
+            "stats_only": False,
+            "show_chains": True,
+            "all_buckets": False,
+            "ascii": False,
+            "help": False,
+        }
+
+        index = 0
+        while index < len(argv):
+            argument = argv[index]
+
+            if argument == "--":
+                options["argv"].extend(argv[index + 1 :])
+                break
+            if argument in ("-h", "--help"):
+                options["help"] = True
+            elif argument == "--json":
+                options["json"] = True
+            elif argument in ("-v", "--visual", "--visualize", "--viz", "--graph"):
+                options["visual"] = True
+            elif argument in ("--stats-only", "--table-only"):
+                options["stats_only"] = True
+                options["stats"] = True
+                options["show_chains"] = False
+            elif argument in ("--stats", "--bucket-stats", "--histogram"):
+                options["stats"] = True
+            elif argument == "--no-stats":
+                options["stats"] = False
+            elif argument == "--no-chains":
+                options["show_chains"] = False
+            elif argument in ("--all-buckets", "--show-empty", "--empty"):
+                options["all_buckets"] = True
+            elif argument in ("--ascii", "--plain"):
+                options["ascii"] = True
+            elif argument in ("-a", "--all"):
+                options["all_threads"] = True
+            elif argument in ("--tcache", "--tcachebins"):
+                options["kinds"].add("tcache")
+            elif argument in ("--fast", "--fastbin", "--fastbins"):
+                options["kinds"].add("fastbin")
+            elif argument in ("--all-bins", "--both"):
+                options["kinds"].update(("tcache", "fastbin"))
+            elif argument in ("--arena", "--arena-address", "--thread"):
+                if index + 1 >= len(argv):
+                    options["argv"].append(argument)
+                else:
+                    index += 1
+                    value = argv[index]
+                    if argument == "--thread":
+                        options["thread_ids"].append(int(value, 0))
+                    else:
+                        options["arena"] = value
+            elif argument.startswith("--arena="):
+                options["arena"] = argument.split("=", 1)[1]
+            elif argument.startswith("--thread="):
+                options["thread_ids"].append(int(argument.split("=", 1)[1], 0))
+            elif argument.startswith("-"):
+                options["argv"].append(argument)
+            else:
+                normalized = self.BIN_NAMES.get(argument.lower())
+                if normalized:
+                    options["kinds"].add(normalized)
+                elif argument.lower() == "all":
+                    options["all_threads"] = True
+                    options["argv"].append(argument)
+                elif argument.isdigit():
+                    options["thread_ids"].append(int(argument, 0))
+                    options["argv"].append(argument)
+                else:
+                    if options["arena"] is None:
+                        options["arena"] = argument
+                    options["argv"].append(argument)
+
+            index += 1
+
+        if not options["kinds"]:
+            options["kinds"] = {"tcache", "fastbin"}
+
+        return options
+
+    def run(self, argv: list[str], forced_kinds: set[str] | None = None) -> str:
+        options = self.parse_arguments(argv, forced_kinds)
+        if options["help"]:
+            return self.help_text()
+
+        layout = self.collect_layout(options)
+        if options["json"]:
+            payload = layout["statistics"] if options["stats_only"] else layout
+            return json.dumps(payload, indent=2, sort_keys=True)
+        return self.render_text(layout, options)
+
+    def help_text(self) -> str:
+        return (
+            "heap bins visualize [tcache|fast|all] [all] [thread_ids...] "
+            "[--arena ADDRESS] [--json] [--stats-only] [--all-buckets] [--ascii]"
+        )
+
+    def new_bucket(
+        self,
+        bin_name: str,
+        index: int,
+        size: int,
+        head: int = 0,
+        memory_count: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "bin": bin_name,
+            "index": index,
+            "size": size,
+            "head": head,
+            "memory_count": memory_count,
+            "observed_count": 0,
+            "observed_bytes": 0,
+            "entries": [],
+            "unique_entries": [],
+            "chunk_bases": [],
+            "chunk_sizes": [],
+            "state": "empty",
+            "issues": [],
+            "loop_address": None,
+            "next_bad_address": None,
+        }
+
+    def collect_layout(self, options: dict[str, Any]) -> dict[str, Any]:
+        layout: dict[str, Any] = {
+            "pointer_size": gef.arch.ptrsize,
+            "tcache": [],
+            "fastbins": None,
+            "statistics": {},
+        }
+
+        if "tcache" in options["kinds"]:
+            layout["tcache"] = self.collect_tcache(options)
+
+        if "fastbin" in options["kinds"]:
+            layout["fastbins"] = self.collect_fastbins(options.get("arena"))
+
+        layout["statistics"] = self.build_statistics(layout)
+        return layout
+
+    def collect_tcache(self, options: dict[str, Any]) -> list[dict[str, Any]]:
+        try:
+            current_thread = gdb.selected_thread()
+            threads = sorted(
+                gdb.selected_inferior().threads(), key=lambda thread: thread.num
+            )
+        except gdb.error as error:
+            return [
+                self.unavailable_context(
+                    "tcache", f"Cannot access inferior threads: {error}"
+                )
+            ]
+
+        requested_ids = set(options["thread_ids"])
+        if options["all_threads"]:
+            selected_threads = threads
+        elif requested_ids:
+            selected_threads = [
+                thread for thread in threads if thread.num in requested_ids
+            ]
+        elif current_thread is not None:
+            selected_threads = [current_thread]
+        else:
+            selected_threads = threads[:1]
+
+        contexts: list[dict[str, Any]] = []
+        try:
+            for thread in selected_threads:
+                thread.switch()
+                contexts.append(self.collect_current_tcache(thread.num))
+        finally:
+            if current_thread is not None:
+                current_thread.switch()
+
+        if not contexts and requested_ids:
+            contexts.append(
+                self.unavailable_context(
+                    "tcache", f"No GDB thread(s) match: {sorted(requested_ids)}"
+                )
+            )
+        return contexts
+
+    def unavailable_context(self, bin_name: str, reason: str) -> dict[str, Any]:
+        return {
+            "bin": bin_name,
+            "available": False,
+            "reason": reason,
+            "address": 0,
+            "buckets": [],
+        }
+
+    def get_tcache_command(self) -> "GlibcHeapTcachebinsCommand | None":
+        return gef.gdb.commands.get(GlibcHeapTcachebinsCommand._cmdline_)
+
+    def collect_current_tcache(self, thread_id: int) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "bin": "tcache",
+            "available": False,
+            "thread_id": thread_id,
+            "address": 0,
+            "max_bins": 0,
+            "count_size": 0,
+            "counter_mode": "unknown",
+            "slot_capacity": None,
+            "buckets": [],
+            "reason": "",
+        }
+
+        if gef.libc.version and gef.libc.version < (2, 26):
+            context["reason"] = "This libc version does not provide tcache"
+            return context
+
+        tcache_command = self.get_tcache_command()
+        if tcache_command is None:
+            context["reason"] = "The 'heap bins tcache' command is not registered"
+            return context
+
+        try:
+            tcache_address = tcache_command.find_tcache()
+        except gdb.error as error:
+            context["reason"] = f"Cannot locate tcache: {error}"
+            return context
+
+        if not tcache_address:
+            context["reason"] = "Uninitialized tcache"
+            return context
+
+        context["available"] = True
+        context["address"] = tcache_address
+        context["max_bins"] = tcache_command.tcache_max_bins or 0
+        context["count_size"] = tcache_command.tcache_count_size or 0
+        context["counter_mode"] = (
+            "remaining" if gef.libc.version and gef.libc.version >= (2, 42) else "count"
+        )
+
+        for index in range(context["max_bins"]):
+            size = gef.heap.tidx2size(index)
+            bucket = self.new_bucket("tcache", index, size)
+            try:
+                head, memory_count = tcache_command.tcachebin_raw(tcache_address, index)
+                bucket["head"] = head
+                bucket["memory_count"] = memory_count
+                if head:
+                    self.populate_chain(bucket, head, "tcache", compare_count=False)
+                self.validate_tcache_bucket(bucket)
+            except gdb.error as error:
+                self.mark_corrupt(bucket, f"Cannot read tcache bucket: {error}")
+            context["buckets"].append(bucket)
+
+        self.normalize_tcache_counts(context)
+        return context
+
+    def collect_fastbins(self, arena_reference: Any = None) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "bin": "fastbin",
+            "available": False,
+            "address": 0,
+            "arena_address_argument": arena_reference,
+            "buckets": [],
+            "reason": "",
+        }
+
+        if not GlibcArena.has_fastbins():
+            context["reason"] = "Fastbins were removed in glibc >= 2.43"
+            return context
+
+        try:
+            arena = self.get_arena(arena_reference)
+        except gdb.error as error:
+            context["reason"] = f"Invalid arena: {error}"
+            return context
+
+        if arena is None:
+            context["reason"] = "Heap/arena is not initialized"
+            return context
+
+        context["available"] = True
+        context["address"] = arena.addr
+        pointer_size = gef.arch.ptrsize
+
+        for index in range(GlibcArena.NFASTBINS):
+            size = (index + 2) * pointer_size * 2
+            try:
+                head = int(arena.fastbinsY[index])
+            except gdb.error as error:
+                bucket = self.new_bucket("fastbin", index, size)
+                self.mark_corrupt(bucket, f"Cannot read fastbinsY[{index}]: {error}")
+                context["buckets"].append(bucket)
+                continue
+
+            bucket = self.new_bucket("fastbin", index, size, head=head)
+            try:
+                if head:
+                    self.populate_chain(bucket, head, "fastbin")
+                self.validate_fastbin_bucket(bucket)
+            except gdb.error as error:
+                self.mark_corrupt(bucket, f"Cannot read fastbin bucket: {error}")
+            context["buckets"].append(bucket)
+
+        return context
+
+    def get_arena(self, arena_reference: Any) -> GlibcArena | None:
+        if isinstance(arena_reference, GlibcArena):
+            arena_reference.reset()
+            return arena_reference
+
+        if arena_reference not in (None, ""):
+            if isinstance(arena_reference, int):
+                arena_address = arena_reference
+            else:
+                arena_address = parse_address(str(arena_reference))
+            return GlibcArena(f"*{arena_address:#x}")
+
+        arena = gef.heap.selected_arena or gef.heap.main_arena
+        if arena is not None:
+            arena.reset()
+        return arena
+
+    def populate_chain(
+        self,
+        bucket: dict[str, Any],
+        head: int,
+        kind: str,
+        compare_count: bool = True,
+    ) -> None:
+        next_address = head
+        first = True
+
+        while next_address:
+            try:
+                if kind == "fastbin":
+                    chunk = GlibcFastChunk(next_address, from_base=True)
+                else:
+                    chunk = GlibcTcacheChunk(next_address)
+            except gdb.error as error:
+                bucket["next_bad_address"] = next_address
+                self.mark_corrupt(
+                    bucket,
+                    ("Cannot read head chunk" if first else "Cannot read next chunk")
+                    + f" at {next_address:#x}: {error}",
+                    "corrupt_head" if first else "corrupt_link",
+                )
+                return
+
+            first = False
+            try:
+                data_address = int(chunk.data_address)
+                base_address = int(chunk.base_address)
+                chunk_size = int(chunk.size)
+            except gdb.error as error:
+                self.mark_corrupt(
+                    bucket, f"Cannot decode chunk at {next_address:#x}: {error}"
+                )
+                return
+
+            bucket["entries"].append(data_address)
+            bucket["chunk_bases"].append(base_address)
+            bucket["chunk_sizes"].append(chunk_size)
+
+            if data_address in bucket["unique_entries"]:
+                bucket["loop_address"] = data_address
+                self.mark_issue(
+                    bucket, f"Linked list loop at {data_address:#x}", "loop"
+                )
+                break
+
+            bucket["unique_entries"].append(data_address)
+
+            try:
+                next_address = int(chunk.fd)
+            except gdb.error as error:
+                self.mark_corrupt(
+                    bucket, f"Cannot read fd from {data_address:#x}: {error}"
+                )
+                return
+
+        bucket["observed_count"] = len(bucket["unique_entries"])
+        bucket["observed_bytes"] = sum(
+            bucket["chunk_sizes"][: bucket["observed_count"]]
+        )
+
+        if compare_count:
+            self.compare_memory_count(bucket)
+
+    def compare_memory_count(self, bucket: dict[str, Any]) -> None:
+        memory_count = bucket.get("memory_count")
+        if memory_count is not None and memory_count != bucket["observed_count"]:
+            self.mark_issue(
+                bucket,
+                f"Memory count {memory_count} differs from walked chain "
+                f"({bucket['observed_count']})",
+                "count_mismatch",
+            )
+
+    def normalize_tcache_counts(self, context: dict[str, Any]) -> None:
+        buckets = context.get("buckets", [])
+        counted_buckets = [
+            bucket for bucket in buckets if bucket.get("memory_count") is not None
+        ]
+        if not counted_buckets:
+            return
+
+        count_score = sum(
+            int(bucket["memory_count"]) == bucket["observed_count"]
+            for bucket in counted_buckets
+        )
+
+        # In glibc 2.42+ num_slots is remaining capacity: raw + walked == C.
+        # Empty bins directly expose C.  Score every plausible C instead of
+        # trusting the libc version, which also keeps synthetic layouts honest.
+        capacities = {
+            int(bucket["memory_count"])
+            for bucket in counted_buckets
+            if bucket["observed_count"] == 0 and int(bucket["memory_count"]) > 0
+        }
+        capacities.update(
+            int(bucket["memory_count"]) + bucket["observed_count"]
+            for bucket in counted_buckets
+            if bucket["observed_count"] > 0
+        )
+        capacities.add(0)
+
+        best_capacity = 0
+        best_remaining_score = -1
+        for capacity in capacities:
+            score = 0
+            for bucket in counted_buckets:
+                raw_slots = int(bucket["memory_count"])
+                if (
+                    raw_slots <= capacity
+                    and capacity - raw_slots == bucket["observed_count"]
+                ):
+                    score += 1
+            if score > best_remaining_score:
+                best_remaining_score = score
+                best_capacity = capacity
+
+        prefer_remaining = context.get("counter_mode") == "remaining"
+        if best_remaining_score > count_score or (
+            best_remaining_score == count_score and prefer_remaining
+        ):
+            context["counter_mode"] = "remaining"
+            context["slot_capacity"] = best_capacity
+            capacity = best_capacity
+        else:
+            context["counter_mode"] = "count"
+            context["slot_capacity"] = None
+
+        for bucket in buckets:
+            raw_slots = bucket.get("memory_count")
+            if raw_slots is None:
+                continue
+            if context["counter_mode"] == "remaining":
+                bucket["remaining_slots"] = raw_slots
+                bucket["slot_capacity"] = capacity
+                bucket["memory_count"] = max(0, capacity - int(raw_slots))
+            self.compare_memory_count(bucket)
+
+    def mark_issue(
+        self, bucket: dict[str, Any], message: str, state: str = "mismatch"
+    ) -> None:
+        bucket["issues"].append(message)
+        severity = {
+            "empty": 0,
+            "ok": 1,
+            "count_mismatch": 2,
+            "size_mismatch": 2,
+            "index_mismatch": 2,
+            "mismatch": 2,
+            "loop": 3,
+            "corrupt": 4,
+            "corrupt_head": 4,
+            "corrupt_link": 4,
+        }
+        if severity.get(state, 2) > severity.get(bucket["state"], 0):
+            bucket["state"] = state
+        elif bucket["state"] == "empty" and bucket["entries"]:
+            bucket["state"] = "ok"
+
+    def mark_corrupt(
+        self, bucket: dict[str, Any], message: str, state: str = "corrupt"
+    ) -> None:
+        bucket["issues"].append(message)
+        bucket["state"] = state
+        bucket["observed_count"] = len(bucket["unique_entries"])
+        bucket["observed_bytes"] = sum(
+            bucket["chunk_sizes"][: bucket["observed_count"]]
+        )
+
+    def fastbin_index(self, size: int) -> int:
+        if gef.arch.ptrsize == 8:
+            return (size >> 4) - 2
+        return (size >> 3) - 2
+
+    def validate_tcache_bucket(self, bucket: dict[str, Any]) -> None:
+        for chunk_size in bucket["chunk_sizes"][: bucket["observed_count"]]:
+            if chunk_size != bucket["size"]:
+                self.mark_issue(
+                    bucket,
+                    f"Chunk size {chunk_size:#x} does not match bucket size {bucket['size']:#x}",
+                    "size_mismatch",
+                )
+                break
+        if bucket["state"] == "empty" and bucket["entries"]:
+            bucket["state"] = "ok"
+
+    def validate_fastbin_bucket(self, bucket: dict[str, Any]) -> None:
+        for chunk_size in bucket["chunk_sizes"][: bucket["observed_count"]]:
+            actual_index = self.fastbin_index(chunk_size)
+            if actual_index != bucket["index"]:
+                self.mark_issue(
+                    bucket,
+                    f"Chunk size {chunk_size:#x} belongs to fastbin index {actual_index}",
+                    "index_mismatch",
+                )
+                break
+            if chunk_size != bucket["size"]:
+                self.mark_issue(
+                    bucket,
+                    f"Chunk size {chunk_size:#x} does not match bucket size {bucket['size']:#x}",
+                    "size_mismatch",
+                )
+                break
+        if bucket["state"] == "empty" and bucket["entries"]:
+            bucket["state"] = "ok"
+
+    def iter_contexts_and_buckets(
+        self, layout: dict[str, Any]
+    ) -> Iterable[tuple[dict[str, Any], dict[str, Any]]]:
+        for context in layout.get("tcache", []):
+            for bucket in context.get("buckets", []):
+                yield context, bucket
+
+        fast_context = layout.get("fastbins")
+        if fast_context:
+            for bucket in fast_context.get("buckets", []):
+                yield fast_context, bucket
+
+    def bucket_is_visible(self, bucket: dict[str, Any], show_empty: bool) -> bool:
+        return (
+            show_empty
+            or bucket["observed_count"] > 0
+            or bucket["head"] != 0
+            or bool(bucket["issues"])
+        )
+
+    def build_statistics(self, layout: dict[str, Any]) -> dict[str, Any]:
+        by_size: dict[int, dict[str, Any]] = {}
+        totals = {
+            "size_buckets": 0,
+            "occupied_buckets": 0,
+            "tcache_chunks": 0,
+            "fastbin_chunks": 0,
+            "chunks": 0,
+            "bytes": 0,
+            "issues": 0,
+        }
+
+        for _context, bucket in self.iter_contexts_and_buckets(layout):
+            totals["issues"] += len(bucket["issues"])
+            if bucket["observed_count"] == 0 and bucket["state"] == "empty":
+                continue
+
+            totals["occupied_buckets"] += 1
+            count = bucket["observed_count"]
+            size = bucket["size"]
+            row = by_size.setdefault(
+                size,
+                {
+                    "size": size,
+                    "tcache": 0,
+                    "fastbin": 0,
+                    "bucket_count": 0,
+                    "chunk_count": 0,
+                    "bytes": 0,
+                },
+            )
+            row["bucket_count"] += 1
+            row["chunk_count"] += count
+            row["bytes"] += bucket["observed_bytes"]
+
+            if bucket["bin"] == "tcache":
+                row["tcache"] += count
+                totals["tcache_chunks"] += count
+            else:
+                row["fastbin"] += count
+                totals["fastbin_chunks"] += count
+
+            totals["chunks"] += count
+            totals["bytes"] += bucket["observed_bytes"]
+
+        totals["size_buckets"] = len(by_size)
+        return {
+            "by_size": [by_size[size] for size in sorted(by_size)],
+            "totals": totals,
+        }
+
+    def render_text(self, layout: dict[str, Any], options: dict[str, Any]) -> str:
+        lines = [titlify("Heap bin visualization")]
+
+        if options["stats_only"]:
+            lines.append(self.render_statistics(layout, options))
+            return "\n".join(line for line in lines if line is not None)
+
+        for context in layout.get("tcache", []):
+            lines.extend(self.render_tcache_context(context, options))
+
+        fast_context = layout.get("fastbins")
+        if fast_context is not None:
+            lines.extend(self.render_fast_context(fast_context, options))
+
+        if options["stats"] is not False:
+            lines.append("")
+            lines.append(self.render_statistics(layout, options))
+
+        return "\n".join(line for line in lines if line is not None)
+
+    def render_tcache_context(
+        self, context: dict[str, Any], options: dict[str, Any]
+    ) -> list[str]:
+        if not context.get("available"):
+            return [
+                Color.boldify("Tcache"),
+                f"  {Color.yellowify('[unavailable]')} {context.get('reason', 'unknown reason')}",
+            ]
+
+        title = (
+            f"Tcache thread {context['thread_id']} @ {context['address']:#x} "
+            f"({context['max_bins']} buckets, {context['count_size']}-byte counters)"
+        )
+        if context.get("slot_capacity"):
+            title += f", {context['slot_capacity']} slots/bin"
+        lines = ["", Color.boldify(title)]
+        visible = [
+            bucket
+            for bucket in context["buckets"]
+            if self.bucket_is_visible(bucket, options["all_buckets"])
+        ]
+        lines.append(self.render_bucket_table("TCACHE", context["buckets"], options))
+
+        if options["show_chains"]:
+            if not visible:
+                lines.append("  All tcache buckets are empty")
+            for bucket in visible:
+                lines.extend(self.render_chain(bucket, options))
+        return lines
+
+    def render_fast_context(
+        self, context: dict[str, Any], options: dict[str, Any]
+    ) -> list[str]:
+        if not context.get("available"):
+            return [
+                "",
+                Color.boldify("Fastbins"),
+                f"  {Color.yellowify('[unavailable]')} {context.get('reason', 'unknown reason')}",
+            ]
+
+        title = f"Fastbins for arena @ {context['address']:#x}"
+        lines = ["", Color.boldify(title)]
+        visible = [
+            bucket
+            for bucket in context["buckets"]
+            if self.bucket_is_visible(bucket, options["all_buckets"])
+        ]
+        lines.append(self.render_bucket_table("FASTBIN", context["buckets"], options))
+
+        if options["show_chains"]:
+            if not visible:
+                lines.append("  All fastbins are empty")
+            for bucket in visible:
+                lines.extend(self.render_chain(bucket, options))
+        return lines
+
+    def bar(self, count: int, maximum: int, ascii_only: bool, width: int = 24) -> str:
+        if count <= 0:
+            return "."
+        filled = max(1, int(round(width * count / max(maximum, 1))))
+        character = "#" if ascii_only else "█"
+        return character * filled
+
+    def render_bucket_table(
+        self, title: str, buckets: list[dict[str, Any]], options: dict[str, Any]
+    ) -> str:
+        visible = [
+            bucket
+            for bucket in buckets
+            if self.bucket_is_visible(bucket, options["all_buckets"])
+        ]
+        if not visible:
+            return f"  {title}: no occupied size buckets"
+
+        maximum = max((bucket["observed_count"] for bucket in visible), default=1)
+        maximum = max(maximum, 1)
+        lines = [
+            f"  {title:<8} {'IDX':>4}  {'SIZE':>8}  {'MEM':>4}  {'SEEN':>4}  {'BYTES':>8}  DISTRIBUTION / STATE"
+        ]
+        for bucket in visible:
+            memory_count = (
+                "-" if bucket["memory_count"] is None else str(bucket["memory_count"])
+            )
+            bar = self.bar(bucket["observed_count"], maximum, options["ascii"])
+            state = bucket["state"]
+            if bucket["issues"]:
+                state += ": " + "; ".join(bucket["issues"])
+            lines.append(
+                f"  {bucket['bin']:<8} {bucket['index']:>4d}  {bucket['size']:#8x}  "
+                f"{memory_count:>4}  {bucket['observed_count']:>4d}  "
+                f"{bucket['observed_bytes']:#8x}  {bar} {state}"
+            )
+        return "\n".join(lines)
+
+    def render_chain(
+        self, bucket: dict[str, Any], options: dict[str, Any]
+    ) -> list[str]:
+        ascii_only = options["ascii"]
+        arrow = "->" if ascii_only else RIGHT_ARROW.strip()
+        null_node = "NULL" if ascii_only else "∅"
+        memory_count = (
+            "n/a" if bucket["memory_count"] is None else str(bucket["memory_count"])
+        )
+        lines = [
+            "",
+            (
+                f"  {bucket['bin']}[idx={bucket['index']}, size={bucket['size']:#x}] "
+                f"memory_count={memory_count} walked_count={bucket['observed_count']} "
+                f"state={bucket['state']}"
+            ),
+        ]
+
+        if not bucket["entries"]:
+            if bucket["head"]:
+                lines.append(f"    head={bucket['head']:#x} {arrow} [unreadable chunk]")
+            else:
+                lines.append(f"    {null_node}")
+            for issue in bucket["issues"]:
+                lines.append(f"    ! {issue}")
+            return lines
+
+        nodes = []
+        for data_address, chunk_size in zip(
+            bucket["entries"], bucket["chunk_sizes"], strict=False
+        ):
+            nodes.append(f"[Chunk(addr={data_address:#x}, size={chunk_size:#x})]")
+        chain = f"    {f' {arrow} '.join(nodes)}" if nodes else "    "
+        if bucket["loop_address"] is not None:
+            chain += f" [loop detected at {bucket['loop_address']:#x}]"
+        elif bucket["next_bad_address"] is not None:
+            chain += f" [unreadable next pointer {bucket['next_bad_address']:#x}]"
+        else:
+            chain += f" {arrow} {null_node}"
+        lines.append(chain)
+
+        details = []
+        for data_address, base_address in zip(
+            bucket["unique_entries"], bucket["chunk_bases"], strict=False
+        ):
+            details.append(f"{data_address:#x}@base={base_address:#x}")
+        if details:
+            lines.append("    addresses: " + ", ".join(details))
+        for issue in bucket["issues"]:
+            if issue not in chain:
+                lines.append(f"    ! {issue}")
+        return lines
+
+    def render_statistics(
+        self, layout: dict[str, Any], options: dict[str, Any] | None = None
+    ) -> str:
+        options = options or {"ascii": False}
+        statistics = layout["statistics"]
+        rows = statistics["by_size"]
+        totals = statistics["totals"]
+        lines = [Color.boldify("== Size-bucket statistics ==")]
+
+        if not rows:
+            lines.append("  No chunks are currently tracked in tcache/fastbin buckets")
+            return "\n".join(lines)
+
+        maximum = max((row["chunk_count"] for row in rows), default=1)
+        lines.append(
+            f"  {'SIZE':>8}  {'TCACHE':>7}  {'FASTBIN':>7}  {'BUCKETS':>7}  "
+            f"{'CHUNKS':>7}  {'BYTES':>8}  DISTRIBUTION"
+        )
+        for row in rows:
+            bar = self.bar(row["chunk_count"], maximum, options.get("ascii", False))
+            lines.append(
+                f"  {row['size']:#8x}  {row['tcache']:>7d}  {row['fastbin']:>7d}  "
+                f"{row['bucket_count']:>7d}  {row['chunk_count']:>7d}  "
+                f"{row['bytes']:#8x}  {bar}"
+            )
+
+        lines.append(
+            "  Total: "
+            f"{totals['chunks']} chunks in {totals['size_buckets']} size bucket(s), "
+            f"{totals['occupied_buckets']} occupied bin(s), {totals['bytes']:#x} bytes, "
+            f"{totals['issues']} issue(s)"
+        )
+        return "\n".join(lines)
+
+
+HeapVisualizer = HeapBinVisualizer
+
+
 @register
 class GlibcHeapBinsCommand(GenericCommand):
     """Display information on the bins on an arena (default: main_arena).
     See https://github.com/sploitfun/lsploits/blob/master/glibc/malloc/malloc.c#L1123."""
 
     _bin_types_ = ("tcache", "fast", "unsorted", "small", "large")
+    _visual_types_ = (
+        "visualize",
+        "visual",
+        "viz",
+        "chart",
+        "graph",
+        "histogram",
+        "graph",
+        "stats",
+        "statistics",
+        "bucket-stats",
+        "bucket",
+        "buckets",
+    )
     _cmdline_ = "heap bins"
-    _syntax_ = f"{_cmdline_} [{'|'.join(_bin_types_)}]"
+    _syntax_ = f"{_cmdline_} [{'|'.join(_bin_types_)}|visualize|stats]"
 
     def __init__(self) -> None:
         super().__init__(prefix=True, complete=gdb.COMPLETE_LOCATION)
@@ -7800,7 +8642,22 @@ class GlibcHeapBinsCommand(GenericCommand):
                 gdb.execute(f"heap bins {bin_t}")
             return
 
+        if any(
+            argument
+            in ("--visual", "-v", "--visualize", "--stats", "--stats-only", "--json")
+            for argument in argv
+        ):
+            gef_print(HeapBinVisualizer().run(argv))
+            return
+
         bin_t = argv[0]
+        if bin_t in self._visual_types_:
+            visual_arguments = list(argv[1:])
+            if bin_t in ("stats", "statistics", "bucket-stats", "buckets"):
+                visual_arguments.append("--stats-only")
+            gef_print(HeapBinVisualizer().run(visual_arguments))
+            return
+
         if bin_t not in self._bin_types_:
             self.usage()
             return
@@ -7840,6 +8697,91 @@ class GlibcHeapBinsCommand(GenericCommand):
         if m:
             gef_print("  ".join(m))
         return nb_chunk
+
+
+@register
+class GlibcHeapBinsVisualizeCommand(GenericCommand):
+    """Visualize tcache/fastbin linked lists and size-bucket statistics."""
+
+    _cmdline_ = "heap bins visualize"
+    _syntax_ = (
+        f"{_cmdline_} [tcache|fast|all] [all] [thread_ids...] "
+        "[--arena ADDRESS] [--json] [--stats-only] [--all-buckets] [--ascii]"
+    )
+    _example_ = [
+        f"{_cmdline_}",
+        f"{_cmdline_} tcache all",
+        f"{_cmdline_} fast 0x555555559000 --ascii",
+        f"{_cmdline_} --json",
+    ]
+    _aliases_ = [
+        "heap bins visual",
+        "heap bins viz",
+        "heap bins vis",
+        "heap bins chart",
+        "heap bins graph",
+        "heap bins histogram",
+        "heap visualize",
+        "heap visual",
+        "heap viz",
+        "heap histogram",
+        "heap-bins-visualize",
+        "heap_bins_visualize",
+        "heap-bins-visual",
+        "heap-bin-visualize",
+        "heap_bin_visualize",
+        "heap-visualize",
+        "heap-visual",
+        "heap-viz",
+        "heap_visual",
+        "tcache-visual",
+        "fastbin-visual",
+    ]
+
+    def __init__(self) -> None:
+        super().__init__(complete=gdb.COMPLETE_LOCATION)
+        return
+
+    @only_if_gdb_running
+    def do_invoke(self, argv: list[str]) -> None:
+        gef_print(HeapBinVisualizer().run(argv))
+        return
+
+
+@register
+class GlibcHeapBinsStatsCommand(GenericCommand):
+    """Show tcache/fastbin counts grouped by allocator size bucket."""
+
+    _cmdline_ = "heap bins stats"
+    _syntax_ = (
+        f"{_cmdline_} [tcache|fast|all] [--arena ADDRESS] [--json] [--all-buckets]"
+    )
+    _example_ = [f"{_cmdline_}", f"{_cmdline_} tcache all", f"{_cmdline_} fast --json"]
+    _aliases_ = [
+        "heap bins statistics",
+        "heap bins statistic",
+        "heap bins bucket-stats",
+        "heap bins bucket",
+        "heap bins buckets",
+        "heap size-stats",
+        "heap size-buckets",
+        "heap bucket-stats",
+        "heap bin-stats",
+        "heap stats",
+        "heap buckets",
+    ]
+
+    def __init__(self) -> None:
+        super().__init__(complete=gdb.COMPLETE_LOCATION)
+        return
+
+    @only_if_gdb_running
+    def do_invoke(self, argv: list[str]) -> None:
+        forwarded_arguments = list(argv)
+        if "--stats-only" not in forwarded_arguments:
+            forwarded_arguments.append("--stats-only")
+        gef_print(HeapBinVisualizer().run(forwarded_arguments))
+        return
 
 
 @register
@@ -7884,6 +8826,23 @@ class GlibcHeapTcachebinsCommand(GenericCommand):
 
     @only_if_gdb_running
     def do_invoke(self, argv: list[str]) -> None:
+        visualizer = HeapBinVisualizer()
+        display_options = visualizer.parse_arguments(argv, {"tcache"})
+        if display_options["help"]:
+            gef_print(self._syntax_)
+            return
+
+        if (
+            display_options["json"]
+            or display_options["visual"]
+            or display_options["stats_only"]
+        ):
+            gef_print(visualizer.run(argv, {"tcache"}))
+            return
+
+        argv = display_options["argv"]
+        bucket_stats_requested = display_options["stats"] is True
+
         # Determine if we are using libc with tcache built in (2.26+)
         if gef.libc.version and gef.libc.version < (2, 26):
             info("No Tcache in this version of libc")
@@ -7965,6 +8924,10 @@ class GlibcHeapTcachebinsCommand(GenericCommand):
                 gef_print("All tcachebins are empty")
 
         current_thread.switch()
+
+        if bucket_stats_requested:
+            stats_arguments = list(display_options["argv"]) + ["--stats-only"]
+            gef_print(visualizer.run(stats_arguments, {"tcache"}))
         return
 
     def find_tcache(self) -> int:
@@ -8016,12 +8979,18 @@ class GlibcHeapTcachebinsCommand(GenericCommand):
         self, tcache_base: int, i: int
     ) -> tuple[GlibcTcacheChunk | None, int]:
         """Return the head chunk in tcache[i] and the number of chunks in the bin."""
+        chunk_address, count = self.tcachebin_raw(tcache_base, i)
+        chunk = GlibcTcacheChunk(chunk_address) if chunk_address else None
+        return chunk, count
+
+    def tcachebin_raw(self, tcache_base: int, i: int) -> tuple[int, int]:
+        """Return the head user-data address and counter for tcache bin ``i``."""
         if i >= self.tcache_max_bins:
             err(
                 "Incorrect index value, index value must be between 0 and "
                 f"{self.tcache_max_bins}-1, given {i}"
             )
-            return None, 0
+            return 0, 0
 
         read_count = u16 if self.tcache_count_size == 2 else u8
         count = read_count(
@@ -8034,8 +9003,7 @@ class GlibcHeapTcachebinsCommand(GenericCommand):
             + self.tcache_count_size * self.tcache_max_bins
             + i * gef.arch.ptrsize
         )
-        chunk = GlibcTcacheChunk(int(chunk)) if chunk else None
-        return chunk, count
+        return int(chunk) if chunk else 0, count
 
     def check_chunk_is_tcache(self, tcache_chunk: GlibcChunk) -> bool:
         """Check min chunk size and the first TCACHE_MAX_BINS bytes to be all <= TCACHE_MAX_BINS"""
@@ -8059,6 +9027,16 @@ class GlibcHeapTcachebinsCommand(GenericCommand):
 
         # all TCACHE_MAX_BINS bytes must be less or equal to TCACHE_MAX_CHUNKS_IN_BIN
         if all(map(lambda i: i <= self.TCACHE_MAX_CHUNKS_IN_BIN, tcache_data)):
+            return True
+
+        # glibc 2.42+ calls this array num_slots: each uint16 stores the number
+        # of slots which can still be filled.  Current glibc releases may use a
+        # default capacity larger than TCACHE_MAX_CHUNKS_IN_BIN.
+        slot_values = [
+            u16(tcache_data[offset : offset + 2])
+            for offset in range(0, len(tcache_data) - 1, 2)
+        ]
+        if slot_values and all(value <= 0x10 for value in slot_values):
             return True
 
         # this is not a tcache chunk as far as we can tell
@@ -8119,15 +9097,49 @@ class GlibcHeapFastbinsYCommand(GenericCommand):
     See https://github.com/sploitfun/lsploits/blob/master/glibc/malloc/malloc.c#L1123."""
 
     _cmdline_ = "heap bins fast"
-    _syntax_ = f"{_cmdline_} [ARENA_ADDRESS]"
+    _syntax_ = (
+        f"{_cmdline_} [ARENA_ADDRESS] [--visual] [--stats] [--stats-only] "
+        "[--json] [--all-buckets] [--ascii]"
+    )
 
     def __init__(self) -> None:
         super().__init__(complete=gdb.COMPLETE_LOCATION)
         return
 
-    @parse_arguments({"arena_address": ""}, {})
+    @parse_arguments(
+        {"arena_address": ""},
+        {
+            ("--visual", "--visualize", "-v"): False,
+            "--stats": False,
+            "--stats-only": False,
+            "--bucket-stats": False,
+            "--json": False,
+            "--all-buckets": False,
+            "--ascii": False,
+            "--no-chains": False,
+        },
+    )
     @only_if_gdb_running
     def do_invoke(self, *_: Any, **kwargs: Any) -> None:
+        args: argparse.Namespace = kwargs["arguments"]
+        visual_arguments = []
+        if args.arena_address:
+            visual_arguments.append(args.arena_address)
+        if args.json:
+            visual_arguments.append("--json")
+        if args.stats_only:
+            visual_arguments.append("--stats-only")
+        if args.all_buckets:
+            visual_arguments.append("--all-buckets")
+        if args.ascii:
+            visual_arguments.append("--ascii")
+        if args.no_chains:
+            visual_arguments.append("--no-chains")
+
+        if args.json or args.visual or args.stats_only:
+            gef_print(HeapBinVisualizer().run(visual_arguments, {"fastbin"}))
+            return
+
         if not GlibcArena.has_fastbins():
             err(
                 "Fastbins were removed in glibc 2.43, this command is not supported here"
@@ -8137,7 +9149,6 @@ class GlibcHeapFastbinsYCommand(GenericCommand):
         def fastbin_index(sz: int) -> int:
             return (sz >> 4) - 2 if SIZE_SZ == 8 else (sz >> 3) - 2
 
-        args: argparse.Namespace = kwargs["arguments"]
         if not gef.heap.main_arena:
             err("Heap not initialized")
             return
@@ -8189,6 +9200,15 @@ class GlibcHeapFastbinsYCommand(GenericCommand):
                     )
                     break
             gef_print()
+
+        if args.stats or args.bucket_stats:
+            stats_arguments = [args.arena_address] if args.arena_address else []
+            stats_arguments.append("--stats-only")
+            if args.all_buckets:
+                stats_arguments.append("--all-buckets")
+            if args.ascii:
+                stats_arguments.append("--ascii")
+            gef_print(HeapBinVisualizer().run(stats_arguments, {"fastbin"}))
         return
 
 
@@ -12758,6 +13778,33 @@ class GefHeapManager(GefManager):
 
     def tidx2size(self, idx: int) -> int:
         return idx * self.malloc_alignment + self.min_chunk_size
+
+    def bin_layout(
+        self,
+        include_tcache: bool = True,
+        include_fastbins: bool = True,
+        arena_address: int | str | None = None,
+        all_threads: bool = False,
+        thread_ids: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Return tcache/fastbin chains and size-bucket statistics as plain data."""
+        visualizer = HeapBinVisualizer()
+        options = visualizer.parse_arguments([])
+        options["kinds"] = set()
+        if include_tcache:
+            options["kinds"].add("tcache")
+        if include_fastbins:
+            options["kinds"].add("fastbin")
+        options["arena"] = arena_address
+        options["all_threads"] = all_threads
+        options["thread_ids"] = list(thread_ids or [])
+        return visualizer.collect_layout(options)
+
+    def bin_statistics(self, **kwargs: Any) -> dict[str, Any]:
+        return self.bin_layout(**kwargs)["statistics"]
+
+    def visualize_bins(self, arguments: list[str] | None = None) -> str:
+        return HeapBinVisualizer().run(list(arguments or []))
 
     def malloc_align_address(self, address: int) -> int:
         """Align addresses according to glibc's MALLOC_ALIGNMENT. See also Issue #689 on Github"""

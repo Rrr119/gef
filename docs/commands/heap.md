@@ -174,6 +174,26 @@ to implement the `heap bins` sub-command, which allows to get info on:
 -  `large bins`
 -  `tcachebins`
 
+#### `heap bins visualize` and `heap bins stats` commands
+
+Use `heap bins visualize` for a bucket-oriented view of the per-thread `tcache` and the arena
+`fastbins`. Occupied buckets include a distribution bar, the walked LIFO chain, chunk addresses and
+sizes, and consistency warnings for count, size, index, loop, or unreadable-link mismatches.
+
+```text
+gef➤ heap bins visualize [tcache|fast|all] [all] [thread_ids...]
+                         [--arena ADDRESS] [--stats-only] [--all-buckets]
+                         [--ascii] [--json]
+gef➤ heap bins stats
+```
+
+`heap bins stats` prints only counts grouped by allocator size bucket. `--json` emits the same
+collected data for scripts. The structured result is also available from Python through
+`gef.heap.bin_layout()` and `gef.heap.bin_statistics()`.
+
+The existing `heap bins tcache` and `heap bins fast` commands keep their original output. They also
+accept `--visual`, `--stats`, `--stats-only`, and `--json` display options.
+
 #### `heap bins fast` command
 
 When exploiting heap corruption vulnerabilities, it is sometimes convenient to know the state of the
